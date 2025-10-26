@@ -4,8 +4,8 @@ Luxembourgish Dictionary Parser (Parallelized with Batching)
 
 Extracts word-to-IPA phoneme mappings from De Lëtzebuerger Dictionnaire (LOD.pdf)
 
-Pattern: WORD [IPA_PHONEME] rest_of_entry
-Example: Aangel [ˈaːŋəl] Femininum (Pluriel...)
+Pattern: WORD [IPA_PHONEME] GRAMMATICAL_CATEGORY
+Example: Aarmebüro [ˈaːməbyːʀoː] Maskulinum
 """
 
 import re
@@ -20,6 +20,9 @@ import multiprocessing
 def extract_page_batch(args: Tuple[int, int, str]) -> Tuple[int, int, Dict[str, str]]:
     """
     Extract word-phoneme pairs from a batch of pages.
+    Only extracts MAIN dictionary entries (word [IPA] followed by grammatical category).
+    
+    Uses strict validation: word must not contain spaces (single word only).
     
     Args:
         args: Tuple of (start_page, end_page, pdf_path)
@@ -30,6 +33,14 @@ def extract_page_batch(args: Tuple[int, int, str]) -> Tuple[int, int, Dict[str, 
     start_page, end_page, pdf_path = args
     
     entries = {}
+    
+    # Grammatical categories in Luxembourgish dictionary
+    CATEGORIES = (
+        'Maskulinum', 'Femininum', 'Neutrum',
+        'Adjektiv', 'Adverb', 'Verb', 'Substantiv',
+        'Pronomen', 'Präposition', 'Konjunktion',
+        'Eegennumm', 'Artikel'
+    )
     
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -43,21 +54,32 @@ def extract_page_batch(args: Tuple[int, int, str]) -> Tuple[int, int, Dict[str, 
                 if not text:
                     continue
                 
+                # Split by newlines to process line by line
                 lines = text.split('\n')
                 
                 for line in lines:
                     if not line.strip():
                         continue
                     
-                    # Look for pattern: WORD [IPA]
-                    match = re.match(r'^(\w[\w\s\-\']*?)\s*\[([^\]]+)\]', line.strip())
+                    # Skip lines that are clearly not main entries
+                    if any(line.strip().startswith(prefix) for prefix in 
+                           ['i ', 'Beispill', 'Synonym', 'Variant', 'DE ', 'FR ', 'EN ', 'PT ']):
+                        continue
+                    
+                    # Pattern: WORD [IPA] CATEGORY
+                    # STRICT: Word must contain NO SPACES - only letters, umlauts, hyphens, apostrophes
+                    # This prevents concatenated multi-word garbage
+                    match = re.match(
+                        r'^([A-Z][a-zäëöüïâêôûœàèéìòùA-Z0-9\-\']*?)\s*\[([^\]]+)\]\s+(' + '|'.join(CATEGORIES) + r')',
+                        line.strip()
+                    )
                     
                     if match:
                         word = match.group(1).strip().lower()
                         ipa = match.group(2).strip()
                         
-                        # Filter out unwanted entries
-                        if len(word) > 1 and not word.startswith('i ') and not word.startswith('beispill'):
+                        # Filter: must be a reasonable word (no spaces, not just digits)
+                        if len(word) > 1 and not word.isdigit() and ' ' not in word:
                             entries[word] = ipa
     
     except Exception as e:

@@ -4,6 +4,7 @@ import numpy as np
 import re
 import spacy
 import unicodedata
+from functools import lru_cache
 
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -220,6 +221,35 @@ SYMBOLS = {'%': 'prozent', '&': 'an', '+': 'plus', '-': 'minus'}
 
 ORDINAL_SUFFIXES = ('ten', 'ter', 'te', 't', 'sten')
 
+DIMINUTIVE_SUFFIXES = ('chen', 'che', 'ercher', 'cher', 'schen')
+COMPOUND_LINKERS = ('', 's', 'es', 'er', 'en', 'n')
+IRREGULAR_INFLECTIONS = {
+    'kanner': 'kand',
+    'kandern': 'kand',
+    'männer': 'mann',
+    'leit': 'leit',
+    'haiser': 'haus',
+    'häiser': 'haus',
+    'haisercher': 'haus',
+    'héiser': 'hees',
+    'geet': 'goen',
+    'geetn': 'goen',
+    'gaang': 'goen',
+    'gaangen': 'goen',
+    'gesäit': 'gesinn',
+    'ass': 'sinn',
+    'sidd': 'sinn',
+    'hat': 'hunn',
+    'hatten': 'hunn',
+    'kënnt': 'kommen',
+}
+UMLAUT_REVERSALS = (
+    ('ä', 'a'),
+    ('ë', 'e'),
+    ('ö', 'o'),
+    ('ü', 'u'),
+)
+
 
 def lowercase_first(word: str) -> str:
     return word[:1].lower() + word[1:]
@@ -231,16 +261,30 @@ class Lexicon:
         with importlib.resources.as_file(importlib.resources.files(data) / 'lb_gold.json') as path:
             with open(path, 'r', encoding='utf-8') as stream:
                 self.golds: Dict[str, str] = json.load(stream)
+        self._known_cache: Dict[str, bool] = {}
 
-    def is_known(self, word: str) -> bool:
+    @lru_cache(maxsize=4096)
+    def has_entry(self, word: str) -> bool:
         if word in self.golds or word in SYMBOLS or word in ADD_SYMBOLS:
             return True
-        if word in LETTER_PHONEMES:
+        if word in LETTER_PHONEMES or word.upper() in LETTER_PHONEMES:
             return True
-        if not word.isalpha():
-            return False
+        return False
+
+    def is_known(self, word: str) -> bool:
+        if self.has_entry(word):
+            return True
+        lower = word.lower()
+        if lower != word and self.has_entry(lower):
+            return True
         if len(word) == 1:
-            return word.upper() in LETTER_PHONEMES
+            return self.has_entry(word.upper())
+        for variant in self.generate_variants(lower):
+            if self.has_entry(variant):
+                return True
+        parts = self.split_compound(lower)
+        if parts:
+            return all(self.has_entry(part) or any(self.has_entry(v) for v in self.generate_variants(part)) for part in parts)
         return False
 
     def lookup(self, word: str, stress: Optional[float]) -> Tuple[Optional[str], Optional[int]]:
@@ -305,10 +349,110 @@ class Lexicon:
             return self.lookup('et', stress)
         if lowered in ('am', 'an') and ctx.future_vowel is False:
             return self.lookup(lowered, stress)
+        common_map = {
+            'ze': 'zu',
+            'zu': 'zu',
+            'mat': 'mat',
+            'op': 'op',
+            'vum': 'vun',
+            'vumm': 'vun',
+            'vunn': 'vun',
+            'vumme': 'vun',
+            'fir': 'fir',
+            'vir': 'vir',
+            'ouni': 'ouni',
+            'beim': 'bei',
+        }
+        if lowered in common_map:
+            return self.lookup(common_map[lowered], stress)
         return None, None
 
-    @staticmethod
-    def _suffix_candidates(word: str) -> Iterable[str]:
+    def part_known(self, part: str) -> bool:
+        if self.has_entry(part):
+            return True
+        for variant in self.generate_variants(part):
+            if self.has_entry(variant):
+                return True
+        return False
+
+    def generate_variants(self, word: str) -> Iterable[str]:
+        variants = set()
+        override = IRREGULAR_INFLECTIONS.get(word)
+        if override:
+            variants.add(override)
+        for suffix in DIMINUTIVE_SUFFIXES:
+            if word.endswith(suffix) and len(word) > len(suffix) + 2:
+                stem = word[:-len(suffix)]
+                variants.add(stem)
+                if suffix.endswith('chen'):
+                    variants.add(stem + 'e')
+        if word.endswith('en') and len(word) > 4:
+            variants.add(word[:-2])
+            variants.add(word[:-2] + 'e')
+        if word.endswith('er') and len(word) > 4:
+            variants.add(word[:-2])
+        if word.endswith('ger') and len(word) > 5:
+            variants.add(word[:-3] + 'g')
+        if word.endswith('ter') and len(word) > 5:
+            variants.add(word[:-3] + 't')
+        if word.endswith('ewer') and len(word) > 6:
+            variants.add(word[:-4] + 'ew')
+        for old, new in UMLAUT_REVERSALS:
+            if old in word:
+                idx = word.rfind(old)
+                variants.add(word[:idx] + new + word[idx + len(old):])
+        if word.endswith('ësch') and len(word) > 5:
+            variants.add(word[:-4])
+        if word.endswith('esch') and len(word) > 5:
+            variants.add(word[:-4])
+        if word.endswith('elt') and len(word) > 4:
+            variants.add(word[:-3])
+        if word.endswith('ëlt') and len(word) > 4:
+            variants.add(word[:-3])
+        if word.endswith('ten') and len(word) > 4:
+            variants.add(word[:-3])
+        return [v for v in variants if v and v != word]
+
+    def split_compound(self, word: str) -> Optional[List[str]]:
+        lower = word.lower()
+
+        @lru_cache(maxsize=2048)
+        def helper(segment: str, depth: int = 0) -> List[List[str]]:
+            sequences: List[List[str]] = []
+            if self.part_known(segment):
+                sequences.append([segment])
+            if len(segment) < 5 or depth > 3:
+                return sequences
+            length = len(segment)
+            for i in range(3, length - 2):
+                left = segment[:i]
+                right = segment[i:]
+                for extend in range(0, min(3, len(right))):
+                    left_candidate = left + right[:extend]
+                    remainder = right[extend:]
+                    if len(remainder) < 2:
+                        continue
+                    if not self.part_known(left_candidate):
+                        continue
+                    for tail in helper(remainder, depth + 1):
+                        sequences.append([left_candidate] + tail)
+                for linker in COMPOUND_LINKERS[1:]:
+                    if right.startswith(linker) and len(right) > len(linker) + 2 and self.part_known(left):
+                        trimmed = right[len(linker):]
+                        for tail in helper(trimmed, depth + 1):
+                            if self.part_known(linker):
+                                sequences.append([left, linker] + tail)
+                            else:
+                                sequences.append([left] + tail)
+            return sequences
+
+        combos = helper(lower, 0)
+        if not combos:
+            return None
+        combos.sort(key=lambda parts: (len(parts), -sum(len(part) for part in parts)))
+        return combos[0]
+
+    def _suffix_candidates(self, word: str) -> Iterable[str]:
         length = len(word)
         if length > 4 and word.endswith('en'):
             yield word[:-2]
@@ -354,6 +498,10 @@ class Lexicon:
         ps, rating = self.lookup(lowered, stress)
         if ps is not None:
             return ps, rating
+        for variant in self.generate_variants(lowered):
+            ps, rating = self.lookup(variant, stress)
+            if ps is not None:
+                return ps, rating
         for candidate in self._suffix_candidates(lowered):
             ps, rating = self.lookup(candidate, stress)
             if ps is not None:
@@ -362,6 +510,27 @@ class Lexicon:
             ps, rating = self.lookup(candidate, stress)
             if ps is not None:
                 return ps, rating
+        compound_parts = self.split_compound(base)
+        if compound_parts:
+            combined = []
+            ratings = []
+            for idx, part in enumerate(compound_parts):
+                part_candidates = [part, *self.generate_variants(part)]
+                part_ps = None
+                part_rating = None
+                for cand in part_candidates:
+                    part_ps, part_rating = self.lookup(cand, stress if idx == 0 else None)
+                    if part_ps is not None:
+                        break
+                if part_ps is None:
+                    combined = []
+                    break
+                if idx > 0:
+                    part_ps = apply_stress(part_ps, -0.5)
+                combined.append(part_ps)
+                ratings.append(4 if part_rating is None else part_rating)
+            if combined:
+                return ' '.join(combined), min(ratings) if ratings else 4
         return None, None
 
     @staticmethod
@@ -455,7 +624,6 @@ class Lexicon:
             return None, None
 
         raw_number = number_part
-        normalized_number = raw_number.replace("’", '').replace("'", '')
         comma_decimal = ',' in raw_number
         dot_sections = [section for section in raw_number.split('.') if section]
         has_dot = '.' in raw_number
@@ -504,12 +672,8 @@ class Lexicon:
                 append_words(ord_words)
         elif number_text.isdigit():
             num = int(number_text)
-            if num >= 1000 and not currency and len(number_text) == 4:
-                # prefer year style: two pairs
-                first = int(number_text[:2])
-                second = int(number_text[2:])
-                append_words(self.cardinal_words(first))
-                append_words(self.cardinal_words(second))
+            if num >= 1000 and not currency:
+                append_words(self.cardinal_words(num))
             elif is_head and num < 100:
                 append_words(self._cardinal_under_hundred(num))
             else:
